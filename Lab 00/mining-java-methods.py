@@ -1,119 +1,228 @@
+#!/usr/bin/env python3
+"""
+mine_java_methods_fixedrepos.py
+
+Mine Java methods from a hard-coded set of popular GitHub repositories.
+
+- Skips repo search API entirely (avoids rate limits).
+- Hard-coded repo list known to contain many Java methods.
+- Collects methods into one CSV file (default: 25k rows).
+- First N (default 20k) go into dataset_split=train, rest eval.
+
+Usage:
+  export GITHUB_TOKEN="ghp_..."
+  python mine_java_methods_fixedrepos.py --out-file ./java_methods.csv
+
+Requirements:
+  pip install requests tqdm javalang  (javalang optional; fallback parser included)
+"""
+
+import os, sys, time, base64, csv, re, argparse, hashlib
+from urllib.parse import quote_plus
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
-import re
-import os
-import csv
-from typing import List, Dict, Optional
+from tqdm import tqdm
 
-GITHUB_API = "https://api.github.com"
-PER_PAGE = 100
+# Try javalang, fallback if unavailable
+try:
+    import javalang
+    HAVE_JAVALANG = True
+except Exception:
+    HAVE_JAVALANG = False
+    print("[warning] javalang not installed — using fallback parser.")
 
-def get_java_files(repo, sha, token, verbose=False):
-    # Recursively lists all Java files at a repo/commit
-    url = f"{GITHUB_API}/repos/{repo}/git/trees/{sha}?recursive=1"
-    headers = {'Authorization': f'token {token}'} if token else {}
-    if verbose: print(f"Fetching tree: {url}")
-    r = requests.get(url, headers=headers)
-    r.raise_for_status()
-    tree = r.json()["tree"]
-    return [item["path"] for item in tree if item["path"].endswith(".java") and item["type"] == "blob"]
+# ----------- Hard-coded repos -----------
+POPULAR_JAVA_REPOS = [
+    "spring-projects/spring-framework",
+    "elastic/elasticsearch",
+    "apache/hadoop",
+    "apache/cassandra",
+    "apache/kafka",
+    "apache/lucene",
+    "eclipse/eclipse.jdt.ls",
+    "google/guava",
+    "square/okhttp",
+    "square/retrofit",
+    "apache/tomcat",
+    "apache/zookeeper",
+    "apache/flink",
+    "netty/netty",
+    "dropwizard/dropwizard",
+]
 
-def get_file_content(repo, path, ref, token, verbose=False):
-    url = f"{GITHUB_API}/repos/{repo}/contents/{path}?ref={ref}"
-    headers = {'Authorization': f'token {token}'} if token else {}
-    if verbose: print(f"Downloading file: {url}")
-    r = requests.get(url, headers=headers)
-    r.raise_for_status()
-    return r.json()["content"].encode("ascii") if r.json().get("encoding") == "base64" else r.json()["content"]
+# ----------- Config -----------
+MAX_WORKERS = 8
+MIN_METHOD_LINES = 2
+MAX_METHOD_LINES = 1000
 
-def extract_java_methods(java_code: str) -> List[Dict]:
-    # Simple regex-based Java method extraction. Can be improved.
-    method_regex = re.compile(
-        r"(?P<doc_comment>/\*\*.*?\*/)?\s*(?P<signature>(public|protected|private|static|\s)+[\w<>\[\]]+\s+[\w<>]+\s*\([^\)]*\))\s*\{(?P<body>.*?)\n\}", 
-        re.DOTALL,
-    )
-    methods = []
-    for match in method_regex.finditer(java_code):
-        doc_comment = match.group("doc_comment") or ""
-        sig = match.group("signature").strip()
-        # Simple name extraction
-        name_match = re.search(r"([\w<>]+)\s*\(", sig)
-        name = name_match.group(1) if name_match else "unknown"
-        tokens = re.findall(r'\w+', sig)
-        methods.append({
-            "name": name,
-            "signature": sig,
-            "doc_comment": doc_comment.strip(),
-            "original_code": match.group(0),
-            "code_tokens": tokens,
-        })
-    return methods
+CSV_FIELDS = [
+    "dataset_split","example_id","repo_name","repo_url","repo_commit_sha","repo_license",
+    "file_path","file_language","method_name","method_qualified_name",
+    "method_start_line","method_end_line","method_signature",
+    "method_original_code","method_doc_comment","code_tokens"
+]
 
-def get_license(repo, token, verbose=False):
-    url = f"{GITHUB_API}/repos/{repo}/license"
-    headers = {'Authorization': f'token {token}'} if token else {}
-    r = requests.get(url, headers=headers)
-    if r.status_code == 200:
-        return r.json().get("license", {}).get("spdx_id", "UNKNOWN")
-    return "UNKNOWN"
+# ----------- GitHub API helpers -----------
+def make_session(token):
+    s = requests.Session()
+    s.headers.update({
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "mine-java-fixedrepos/1.0"
+    })
+    return s
 
-def scrape_methods_to_csv(repo, commit_sha, dataset_split, out_csv, token=None, verbose=True):
-    # License and metadata
-    license = get_license(repo, token, verbose)
-    java_files = get_java_files(repo, commit_sha, token, verbose)
-    url = f"https://github.com/{repo}"
-    results = []
-    for path in java_files:
-        content = get_file_content(repo, path, commit_sha, token, verbose)
-        try:
-            decoded = content.decode("utf-8")
-        except AttributeError:
-            decoded = content
-        methods = extract_java_methods(decoded)
-        for m in methods:
-            # Find lines
-            lines = decoded.splitlines()
-            idx = decoded.find(m["original_code"])
-            start_line = decoded[:idx].count("\n") + 1
-            end_line = start_line + m["original_code"].count("\n")
-            qualified_name = f"{path.replace('/', '.')}" + "#" + m["name"]
-            example_id = f"{repo}@{commit_sha[:7]}:{path}#{start_line}-{end_line}"
-            result = {
-                "dataset_split": dataset_split,
-                "example_id": example_id,
-                "repo.name": repo.split("/")[-1],
-                "repo.url": url,
-                "repo.commit_sha": commit_sha,
-                "repo.license": license,
-                "file.path": path,
-                "file.language": "Java",
-                "method.name": m["name"],
-                "method.qualified_name": qualified_name,
-                "method.start_line": start_line,
-                "method.end_line": end_line,
-                "method.signature": m["signature"],
-                "method.original_code": m["original_code"],
-                "method.doc_comment": m["doc_comment"],
-                "code_tokens": ' '.join(m["code_tokens"]),
-            }
-            results.append(result)
-    fieldnames = [
-        "dataset_split", "example_id", "repo.name", "repo.url", "repo.commit_sha", "repo.license", 
-        "file.path", "file.language", "method.name", "method.qualified_name", "method.start_line", 
-        "method.end_line", "method.signature", "method.original_code", "method.doc_comment", "code_tokens"
-    ]
-    with open(out_csv, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in results:
-            writer.writerow(row)
-    if verbose:
-        print(f"Wrote {len(results)} methods to {out_csv}")
+def retry_get(session, url, params=None, tries=6, backoff=2.0):
+    wait = 1
+    for i in range(tries):
+        r = session.get(url, params=params, timeout=30)
+        if r.status_code == 200:
+            return r
+        if r.status_code in (403, 429) or 500 <= r.status_code < 600:
+            time.sleep(wait)
+            wait *= backoff
+            continue
+        raise RuntimeError(f"GET {url} failed: {r.status_code} {r.text[:200]}")
+    raise RuntimeError(f"GET {url} failed after {tries} tries")
 
-# Usage: Set environment variable GITHUB_TOKEN or pass directly
-if __name__ == "__main__":
-    # Minimal example
-    repo = "acme/awesome-lib"
-    commit_sha = "3f9c2b1a7b0f41e3b7ad483f0b2f5e2f8f7e3a22"
-    dataset_split = "train"
-    token = os.environ.get("GITHUB_TOKEN")
-    scrape_methods_to_csv(repo, commit_sha, dataset_split, "java_methods.csv", token)
+def get_repo_commit_sha(session, owner, repo, branch):
+    url = f"https://api.github.com/repos/{owner}/{repo}/commits/{quote_plus(branch)}"
+    return retry_get(session, url).json()["sha"]
+
+def get_repo_tree(session, owner, repo, commit_sha):
+    url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{commit_sha}"
+    return retry_get(session, url, params={"recursive":"1"}).json()
+
+def get_file_contents(session, owner, repo, path, ref=None):
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    params = {} if not ref else {"ref": ref}
+    j = retry_get(session, url, params=params).json()
+    if isinstance(j, dict) and j.get("encoding") == "base64":
+        return base64.b64decode(j["content"]).decode("utf-8", errors="replace")
+    return None
+
+# ----------- Java parsing helpers -----------
+def find_method_end_line(lines, start_idx):
+    depth = 0
+    started = False
+    for j in range(start_idx, len(lines)):
+        for ch in lines[j]:
+            if ch == "{": depth += 1; started = True
+            elif ch == "}": depth -= 1
+        if started and depth == 0:
+            return j
+    return len(lines)-1
+
+def extract_javadoc_above(lines, idx):
+    i = idx-1
+    while i >= 0 and lines[i].strip() == "": i -= 1
+    if i >= 0 and "*/" in lines[i]:
+        out=[]
+        while i >= 0:
+            out.append(lines[i])
+            if "/**" in lines[i]: return "\n".join(reversed(out))
+            i -= 1
+    return ""
+
+def tokenize_code(code):
+    if HAVE_JAVALANG:
+        try: return [t.value for t in javalang.tokenizer.tokenize(code)]
+        except: return re.findall(r"\w+|[^\s\w]", code)
+    return re.findall(r"\w+|[^\s\w]", code)
+
+def extract_methods(source, repo, file_path, commit_sha, license_str, train_cutoff, collected):
+    rows=[]
+    lines = source.splitlines()
+    if HAVE_JAVALANG:
+        try: tree = javalang.parse.parse(source)
+        except: return []
+        for _, node in tree.filter(javalang.tree.MethodDeclaration):
+            if not node.position: continue
+            start = node.position.line-1
+            end = find_method_end_line(lines, start)
+            if end-start+1 < MIN_METHOD_LINES or end-start+1 > MAX_METHOD_LINES: continue
+            code="\n".join(lines[start:end+1])
+            doc=extract_javadoc_above(lines,start)
+            sig=node.name
+            tokens=tokenize_code(code)
+            exid=f"{repo}@{commit_sha}:{file_path}#{start+1}-{end+1}"
+            split="train" if collected < train_cutoff else "eval"
+            rows.append({
+                "dataset_split":split,"example_id":exid,
+                "repo_name":repo,"repo_url":f"https://github.com/{repo}",
+                "repo_commit_sha":commit_sha,"repo_license":license_str,
+                "file_path":file_path,"file_language":"Java",
+                "method_name":node.name,
+                "method_qualified_name":f"{repo}#{file_path}:{node.name}@{start+1}-{end+1}",
+                "method_start_line":start+1,"method_end_line":end+1,
+                "method_signature":sig,"method_original_code":code,
+                "method_doc_comment":doc,"code_tokens":" ".join(tokens)
+            })
+    else:
+        # fallback regex
+        pat=re.compile(r'(public|private|protected|static|\s)+[\w<>\[\]]+\s+(\w+)\s*\([^)]*\)\s*\{',re.M)
+        for m in pat.finditer(source):
+            start=source.count("\n",0,m.start())
+            end=find_method_end_line(lines,start)
+            if end-start+1<MIN_METHOD_LINES or end-start+1>MAX_METHOD_LINES: continue
+            code="\n".join(lines[start:end+1])
+            tokens=tokenize_code(code)
+            name=m.group(2)
+            exid=f"{repo}@{commit_sha}:{file_path}#{start+1}-{end+1}"
+            split="train" if collected<train_cutoff else "eval"
+            rows.append({
+                "dataset_split":split,"example_id":exid,
+                "repo_name":repo,"repo_url":f"https://github.com/{repo}",
+                "repo_commit_sha":commit_sha,"repo_license":license_str,
+                "file_path":file_path,"file_language":"Java",
+                "method_name":name,
+                "method_qualified_name":f"{repo}#{file_path}:{name}@{start+1}-{end+1}",
+                "method_start_line":start+1,"method_end_line":end+1,
+                "method_signature":m.group(0).strip(),"method_original_code":code,
+                "method_doc_comment":"","code_tokens":" ".join(tokens)
+            })
+    return rows
+
+# ----------- main loop -----------
+def mine_fixed(token,out_file,target=25000,train=20000):
+    s=make_session(token)
+    collected=0; seen=set()
+    os.makedirs(os.path.dirname(out_file) or ".",exist_ok=True)
+    with open(out_file,"w",newline="",encoding="utf-8") as f:
+        w=csv.DictWriter(f,fieldnames=CSV_FIELDS); w.writeheader()
+        pbar=tqdm(total=target,desc="Collected methods")
+        for repo in POPULAR_JAVA_REPOS:
+            if collected>=target: break
+            owner,name=repo.split("/")
+            try: sha=get_repo_commit_sha(s,owner,name,"master")
+            except: sha=get_repo_commit_sha(s,owner,name,"main")
+            tree=get_repo_tree(s,owner,name,sha)
+            java_files=[t["path"] for t in tree.get("tree",[]) if t["type"]=="blob" and t["path"].endswith(".java")]
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+                futs=[ex.submit(get_file_contents,s,owner,name,p,ref=sha) for p in java_files]
+                for path,fut in zip(java_files,futs):
+                    if collected>=target: break
+                    code=fut.result()
+                    if not code: continue
+                    rows=extract_methods(code,repo,path,sha,"",train,collected)
+                    for r in rows:
+                        if collected>=target: break
+                        h=hashlib.sha1(r["method_original_code"].encode()).hexdigest()
+                        if h in seen: continue
+                        seen.add(h)
+                        if collected<train: r["dataset_split"]="train"
+                        else: r["dataset_split"]="eval"
+                        w.writerow(r); collected+=1; pbar.update(1)
+        pbar.close()
+    print(f"[+] Done. Collected {collected} methods -> {out_file}")
+
+# ----------- CLI -----------
+if __name__=="__main__":
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--token",default=os.environ.get("GITHUB_TOKEN"))
+    ap.add_argument("--out-file",default="./java_methods_fixed.csv")
+    ap.add_argument("--target-methods",type=int,default=25000)
+    ap.add_argument("--train-count",type=int,default=20000)
+    args=ap.parse_args()
+    if not args.token: sys.exit("Missing GitHub token.")
+    mine_fixed(args.token,args.out_file,args.target_methods,args.train_count)
